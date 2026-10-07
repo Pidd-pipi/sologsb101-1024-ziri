@@ -13,6 +13,19 @@ import {
 } from '@/types/shelf'
 import type { Batch } from '@/types/batch'
 import { useMilkStore } from '@/stores/milkStore'
+import {
+  planReshuffle,
+  type ReshuffleAssignment,
+  type ReshufflePlan,
+  type ReshuffleResult
+} from '@/utils/reshuffle'
+
+/** 温区换架执行结果 */
+export interface ShelfReshuffleResult {
+  ok: boolean
+  message: string
+  plan?: ReshufflePlan
+}
 
 export interface NewShelfInput {
   room: string
@@ -262,6 +275,126 @@ export const useShelfStore = defineStore('shelf', () => {
     return TEMP_ZONES
   }
 
+  /**
+   * 温区换架：把熟成中批次一次性重排到同温区其他窖位（含两两对调）。
+   * - 先在最新数据上排出全程不超块的挪动步骤，凑不出临时空位即整单拒绝（不写任何数据）；
+   * - 全部写入放在同一个 Dexie 事务里，中途失败由 IndexedDB 自动回滚，窖位与批次位置恢复原样；
+   * - 换架后占用数以「实际在架批次数」重算，与实际放着的批次对齐；
+   * - 未执行（待执行）的转架作业跟到新窖位，已完成 / 已跳过保留当时窖位。
+   */
+  async function reshuffleZone(
+    tempZone: TempZone,
+    assignments: ReshuffleAssignment[]
+  ): Promise<ShelfReshuffleResult> {
+    // 以数据库中的最新数据重新规划，避免本地 liveQuery 缓存滞后导致误判
+    const [liveShelves, liveBatches] = await Promise.all([
+      db.shelves.toArray(),
+      db.batches.toArray()
+    ])
+    const planned: ReshuffleResult = planReshuffle({
+      tempZone,
+      shelves: liveShelves,
+      batches: liveBatches,
+      assignments
+    })
+    if (!planned.ok) return { ok: false, message: planned.message }
+    if (planned.steps.length === 0) {
+      return { ok: false, message: '所有批次都在原窖位，没有需要换架的批次' }
+    }
+
+    const zoneShelfIds = new Set(
+      liveShelves.filter((shelf) => shelf.tempZone === tempZone).map((shelf) => shelf.id)
+    )
+    const finalShelfOf = new Map(assignments.map((item) => [item.batchId, item.targetShelfId]))
+    const movedBatchIds = assignments
+      .filter((item) => {
+        const batch = liveBatches.find((row) => row.id === item.batchId)
+        return batch?.shelfId && batch.shelfId !== item.targetShelfId
+      })
+      .map((item) => item.batchId)
+    const now = Date.now()
+
+    try {
+      await db.transaction(
+        'rw',
+        [db.shelves, db.batches, db.turnings],
+        async () => {
+          // 事务内再读一遍并复核：被其他标签页改动过则整单放弃（事务回滚）
+          const [txShelves, txBatches] = await Promise.all([
+            db.shelves.where('tempZone').equals(tempZone).toArray(),
+            db.batches.toArray()
+          ])
+          const txShelfIds = new Set(txShelves.map((shelf) => shelf.id))
+          for (const assignment of assignments) {
+            const batch = txBatches.find((row) => row.id === assignment.batchId)
+            if (!batch || batch.state !== '熟成中' || !batch.shelfId || !txShelfIds.has(batch.shelfId)) {
+              throw new Error('批次窖位状态已变化，请刷新后重试')
+            }
+            if (!txShelfIds.has(assignment.targetShelfId)) {
+              throw new Error('目标窖位不在同一温区，请刷新后重试')
+            }
+          }
+
+          // 1. 回写批次新窖位（只改实际挪动的批次）
+          for (const batchId of movedBatchIds) {
+            await db.batches.update(batchId, {
+              shelfId: finalShelfOf.get(batchId),
+              updatedAt: now
+            })
+          }
+
+          // 2. 温区内每个窖位的占用数按换架后实际在架批次数重算
+          const residents = await db.batches
+            .where('shelfId')
+            .anyOf([...zoneShelfIds])
+            .toArray()
+          const counts = new Map<string, number>([...zoneShelfIds].map((id) => [id, 0]))
+          residents.forEach((batch) => {
+            if (batch.shelfId && counts.has(batch.shelfId)) {
+              counts.set(batch.shelfId, (counts.get(batch.shelfId) ?? 0) + 1)
+            }
+          })
+          for (const shelf of txShelves) {
+            const occupied = counts.get(shelf.id) ?? 0
+            if (occupied > shelf.capacity) {
+              throw new Error('换架后占用超过窖位可放块数，已中止并恢复原样')
+            }
+            if (occupied !== shelf.occupied) {
+              await db.shelves.update(shelf.id, { occupied, updatedAt: now })
+            }
+          }
+
+          // 3. 未执行（待执行）的转架作业跟到新窖位；已完成 / 已跳过保留当时窖位
+          for (const batchId of movedBatchIds) {
+            const targetShelfId = finalShelfOf.get(batchId)
+            if (!targetShelfId) continue
+            await db.turnings
+              .where('batchId')
+              .equals(batchId)
+              .and((turning) => turning.state === '待执行')
+              .modify((turning) => {
+                turning.shelfId = targetShelfId
+                turning.updatedAt = now
+              })
+          }
+        }
+      )
+    } catch (err) {
+      return {
+        ok: false,
+        message: err instanceof Error ? err.message : '换架中途失败，窖位与批次位置已恢复原样'
+      }
+    }
+
+    return {
+      ok: true,
+      plan: planned,
+      message: `${tempZone}换架完成：${planned.movedBatchCount} 个批次挪动${
+        planned.swapPairCount > 0 ? `（含 ${planned.swapPairCount} 组对调）` : ''
+      }，待执行转架作业已跟到新窖位`
+    }
+  }
+
   return {
     shelves,
     loading,
@@ -292,6 +425,7 @@ export const useShelfStore = defineStore('shelf', () => {
     removeShelf,
     assignBatch,
     releaseBatch,
+    reshuffleZone,
     zoneOptions
   }
 })

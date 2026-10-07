@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Delete, Edit, Plus, Position } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Position, Switch } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, {
   type FilterModel,
@@ -13,6 +13,7 @@ import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
 import { TEMP_ZONES, createEmptyShelfFilter, type Shelf, type TempZone } from '@/types/shelf'
 import { TEMP_RANGE, ZONE_COLOR } from '@/utils/temperature'
+import { planReshuffle, type ReshuffleResult } from '@/utils/reshuffle'
 
 const shelfStore = useShelfStore()
 const milkStore = useMilkStore()
@@ -241,6 +242,149 @@ function batchOptionLabel(batchId: string): string {
   if (!batch) return batchId
   return `${milkStore.milkNameOf(batch.milkId)} · ${batch.cheeseType} ${batch.curdedAt}（${batch.weightKg}kg）`
 }
+
+/* ------------------------------ 温区换架 ------------------------------ */
+
+const reshuffleDialogVisible = ref(false)
+const reshuffleZone = ref<TempZone>('冷区')
+const reshuffleTargets = reactive<Record<string, string>>({})
+const reshuffleSubmitting = ref(false)
+
+/** 当前换架温区下的窖位 */
+const reshuffleShelves = computed<Shelf[]>(() =>
+  shelves.value.filter((shelf) => shelf.tempZone === reshuffleZone.value)
+)
+
+/** 参与换架的批次：熟成中、当前窖位在所选温区 */
+const reshuffleBatches = computed(() =>
+  milkStore.batches.filter(
+    (batch) =>
+      batch.state === '熟成中' &&
+      !!batch.shelfId &&
+      reshuffleShelves.value.some((shelf) => shelf.id === batch.shelfId)
+  )
+)
+
+/** 每个窖位换架前实际在架批次数（含非参与批次，照样占块） */
+const reshuffleInitialCounts = computed<Record<string, number>>(() => {
+  const counts: Record<string, number> = {}
+  reshuffleShelves.value.forEach((shelf) => {
+    counts[shelf.id] = milkStore.batches.filter((batch) => batch.shelfId === shelf.id).length
+  })
+  return counts
+})
+
+/** 按当前指派实时计算的换架规划（不可行时返回 ok:false 与原因） */
+const reshufflePlan = computed<ReshuffleResult>(() =>
+  planReshuffle({
+    tempZone: reshuffleZone.value,
+    shelves: shelves.value,
+    batches: milkStore.batches,
+    assignments: reshuffleBatches.value.map((batch) => ({
+      batchId: batch.id,
+      targetShelfId: reshuffleTargets[batch.id] ?? (batch.shelfId as string)
+    }))
+  })
+)
+
+/** 每个窖位按当前指派的换架后块数 */
+function reshuffleFinalCount(shelfId: string): number {
+  if (reshufflePlan.value.ok) return reshufflePlan.value.finalOccupancy[shelfId] ?? 0
+  let count = reshuffleInitialCounts.value[shelfId] ?? 0
+  reshuffleBatches.value.forEach((batch) => {
+    const target = reshuffleTargets[batch.id]
+    if (target && batch.shelfId && target !== batch.shelfId) {
+      if (batch.shelfId === shelfId) count -= 1
+      if (target === shelfId) count += 1
+    }
+  })
+  return count
+}
+
+/** 实际换窖位的批次数 */
+const reshuffleChangedCount = computed(
+  () =>
+    reshuffleBatches.value.filter(
+      (batch) => reshuffleTargets[batch.id] && reshuffleTargets[batch.id] !== batch.shelfId
+    ).length
+)
+
+function resetReshuffleTargets(): void {
+  Object.keys(reshuffleTargets).forEach((key) => delete reshuffleTargets[key])
+  reshuffleBatches.value.forEach((batch) => {
+    if (batch.shelfId) reshuffleTargets[batch.id] = batch.shelfId
+  })
+}
+
+function openReshuffleDialog(zone: TempZone = '冷区'): void {
+  reshuffleZone.value = zone
+  resetReshuffleTargets()
+  reshuffleDialogVisible.value = true
+}
+
+// 切换温区后重新按「批次当前窖位」初始化目标指派
+watch(reshuffleZone, () => resetReshuffleTargets())
+
+function reshuffleShelfText(shelfId: string): string {
+  return shelfStore.shelfLabel(shelfId)
+}
+
+function reshuffleStepText(kind: string): string {
+  if (kind === '借位腾挪') return '借位腾挪'
+  if (kind === '归位') return '归位'
+  return '直接挪架'
+}
+
+function reshuffleBatchText(batchId: string): string {
+  const batch = milkStore.batches.find((item) => item.id === batchId)
+  if (!batch) return batchId
+  return `${milkStore.milkNameOf(batch.milkId)} · ${batch.cheeseType}`
+}
+
+async function submitReshuffle(): Promise<void> {
+  if (!reshufflePlan.value.ok) return
+  if (reshuffleChangedCount.value === 0) {
+    ElMessage.info('没有需要换架的批次，请先调整目标窖位')
+    return
+  }
+  const plan = reshufflePlan.value
+  try {
+    await ElMessageBox.confirm(
+      `本次${reshuffleZone.value}换架将挪动 ${plan.movedBatchCount} 个批次` +
+        `${plan.swapPairCount > 0 ? `（含 ${plan.swapPairCount} 组对调）` : ''}` +
+        `，共 ${plan.steps.length} 步${
+          plan.bufferShelfIds.length > 0
+            ? `，执行时临时借用 ${plan.bufferShelfIds
+                .map((id) => reshuffleShelfText(id))
+                .join('、')}`
+            : ''
+        }。待执行的转架作业会跟到新窖位，已完成的保留当时窖位。是否继续？`,
+      '确认换架',
+      { type: 'warning', confirmButtonText: '确认换架', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  reshuffleSubmitting.value = true
+  try {
+    const result = await shelfStore.reshuffleZone(
+      reshuffleZone.value,
+      reshuffleBatches.value.map((batch) => ({
+        batchId: batch.id,
+        targetShelfId: reshuffleTargets[batch.id] ?? (batch.shelfId as string)
+      }))
+    )
+    if (result.ok) {
+      ElMessage.success(result.message)
+      reshuffleDialogVisible.value = false
+    } else {
+      ElMessage.warning(result.message)
+    }
+  } finally {
+    reshuffleSubmitting.value = false
+  }
+}
+
 </script>
 
 <template>
@@ -254,6 +398,9 @@ function batchOptionLabel(batchId: string): string {
         <el-button type="primary" :icon="Plus" @click="openShelfDialog()">新建窖位</el-button>
         <el-button :icon="Position" :disabled="unassignedBatches.length === 0" @click="openAssignDialog()">
           上架分配
+        </el-button>
+        <el-button type="warning" plain :icon="Switch" @click="openReshuffleDialog('冷区')">
+          温区换架
         </el-button>
       </div>
     </div>
@@ -509,6 +656,152 @@ function batchOptionLabel(batchId: string): string {
         <el-button type="primary" @click="submitAssign">确认上架</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="reshuffleDialogVisible" title="温区换架（窖位调整）" width="820px" destroy-on-close>
+      <el-alert type="info" :closable="false" show-icon>
+        <template #title>
+          批次只能挪到<span style="font-weight: 600">同一温区</span>的其他窖位；对调时系统会安排同温区空余窖位临时腾挪，
+          全程不超过任何窖位的可放块数。整温区凑不出空位将拒绝换架；中途失败自动恢复原样。待执行的转架作业跟到新窖位，已完成的保留当时窖位。
+        </template>
+      </el-alert>
+
+      <div class="reshuffle-toolbar">
+        <span class="filter-label">调整温区</span>
+        <el-radio-group v-model="reshuffleZone">
+          <el-radio-button v-for="zone in TEMP_ZONES" :key="zone" :value="zone">
+            {{ zone }}
+          </el-radio-button>
+        </el-radio-group>
+        <span class="muted">适宜温度 {{ zoneRangeText(reshuffleZone) }}</span>
+      </div>
+
+      <EmptyPanel
+        v-if="reshuffleBatches.length === 0"
+        compact
+        title="该温区没有熟成中的批次"
+        description="只有熟成中、当前窖位在该温区的批次才能参与换架。"
+      />
+
+      <template v-else>
+        <el-table :data="reshuffleBatches" border stripe size="small">
+          <el-table-column label="批次" min-width="190">
+            <template #default="{ row }">
+              {{ milkStore.milkNameOf(row.milkId) }} · {{ row.cheeseType }}
+              <span class="muted">{{ row.curdedAt }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="当前窖位" min-width="180">
+            <template #default="{ row }">
+              {{ shelfStore.shelfLabel(row.shelfId) }}
+            </template>
+          </el-table-column>
+          <el-table-column label="" width="40" align="center">
+            <template #default><el-icon><Switch /></el-icon></template>
+          </el-table-column>
+          <el-table-column label="目标窖位（同温区）" min-width="240">
+            <template #default="{ row }">
+              <el-select v-model="reshuffleTargets[row.id]" style="width: 100%">
+                <el-option
+                  v-for="shelf in reshuffleShelves"
+                  :key="shelf.id"
+                  :label="`${shelfStore.shelfLabel(shelf.id)}（上限 ${shelf.capacity} 块，换后 ${reshuffleFinalCount(
+                    shelf.id
+                  )} 块）`"
+                  :value="shelf.id"
+                />
+              </el-select>
+            </template>
+          </el-table-column>
+        </el-table>
+
+        <div class="section-card__head reshuffle-summary">
+          <h4 style="margin: 0">窖位占用对照（按实际在架批次）</h4>
+          <span class="muted">
+            换架 {{ reshuffleChangedCount }} 个批次
+            <template v-if="reshufflePlan.ok">
+              ，{{ reshufflePlan.steps.length }} 步
+              <template v-if="reshufflePlan.swapPairCount > 0">
+                ，{{ reshufflePlan.swapPairCount }} 组对调
+              </template>
+              <template v-if="reshufflePlan.bufferShelfIds.length > 0">
+                ，临时借用 {{ reshufflePlan.bufferShelfIds.length }} 个窖位
+              </template>
+            </template>
+          </span>
+        </div>
+
+        <div class="reshuffle-shelves">
+          <div
+            v-for="shelf in reshuffleShelves"
+            :key="shelf.id"
+            class="reshuffle-shelf"
+            :class="{
+              'is-over': reshuffleFinalCount(shelf.id) > shelf.capacity,
+              'is-full': reshuffleFinalCount(shelf.id) === shelf.capacity
+            }"
+          >
+            <span class="reshuffle-shelf__name">{{ shelfStore.shelfLabel(shelf.id) }}</span>
+            <span class="mono">
+              {{ reshuffleInitialCounts[shelf.id] ?? 0 }} →
+              <strong>{{ reshuffleFinalCount(shelf.id) }}</strong>
+              / {{ shelf.capacity }}
+            </span>
+          </div>
+        </div>
+
+        <el-alert
+          v-if="!reshufflePlan.ok"
+          type="error"
+          :closable="false"
+          show-icon
+          :title="reshufflePlan.message"
+        />
+        <el-alert
+          v-else-if="reshuffleChangedCount === 0"
+          type="info"
+          :closable="false"
+          show-icon
+          title="所有批次都在原窖位，调整目标窖位后才会执行换架。"
+        />
+        <el-alert
+          v-else-if="reshufflePlan.bufferShelfIds.length > 0"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="`存在对调 / 闭环，执行时将依次临时借用：${reshufflePlan.bufferShelfIds
+            .map((id) => reshuffleShelfText(id))
+            .join('、')}，借用期间同样不超可放块数。`"
+        />
+        <el-alert v-else type="success" :closable="false" show-icon title="全部批次均可一步挪入目标窖位，无需借位。" />
+
+        <template v-if="reshufflePlan.ok && reshuffleChangedCount > 0">
+          <p class="muted reshuffle-steps-title">执行步骤预览：</p>
+          <ol class="reshuffle-steps">
+            <li v-for="(step, index) in reshufflePlan.steps" :key="index">
+              <el-tag size="small" :type="step.temporary ? 'warning' : step.kind === '归位' ? 'success' : 'info'">
+                {{ reshuffleStepText(step.kind) }}
+              </el-tag>
+              <span>{{ reshuffleBatchText(step.batchId) }}</span>
+              <span class="muted">
+                {{ reshuffleShelfText(step.fromShelfId) }} → {{ reshuffleShelfText(step.toShelfId) }}
+              </span>
+            </li>
+          </ol>
+        </template>
+      </template>
+
+      <template #footer>
+        <el-button @click="reshuffleDialogVisible = false">取消</el-button>
+        <el-button
+          type="primary"
+          :loading="reshuffleSubmitting"
+          :disabled="!reshufflePlan.ok || reshuffleChangedCount === 0"
+          @click="submitReshuffle"
+        >
+          确认换架
+        </el-button>
+      </template>
+    </el-dialog>
   </section>
 </template>
 
@@ -584,5 +877,68 @@ function batchOptionLabel(batchId: string): string {
 
 .room-select {
   width: 170px;
+}
+
+.reshuffle-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 0 12px;
+  flex-wrap: wrap;
+}
+
+.reshuffle-summary {
+  margin: 16px 0 8px;
+}
+
+.reshuffle-shelves {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.reshuffle-shelf {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 180px;
+  padding: 8px 12px;
+  border: 1px solid #e7dfd0;
+  border-radius: 8px;
+  background: #fffdf8;
+}
+
+.reshuffle-shelf.is-full {
+  border-color: #d68910;
+}
+
+.reshuffle-shelf.is-over {
+  border-color: #c0392b;
+  background: #fdecea;
+}
+
+.reshuffle-shelf__name {
+  font-size: 13px;
+}
+
+.reshuffle-steps-title {
+  margin: 12px 0 6px;
+  font-size: 13px;
+}
+
+.reshuffle-steps {
+  margin: 0;
+  padding-left: 20px;
+  max-height: 180px;
+  overflow-y: auto;
+  font-size: 13px;
+}
+
+.reshuffle-steps li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
 }
 </style>
