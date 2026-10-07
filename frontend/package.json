@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview --port 22824"
+    "preview": "vite preview --port 22824",
+    "test:reshuffle": "esbuild test/reshuffle.test.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/reshuffle.test.mjs --log-level=error && node node_modules/.cache/reshuffle.test.mjs",
+    "test:reshuffle:integration": "esbuild test/reshuffle.integration.ts --bundle --platform=node --format=esm --outfile=node_modules/.cache/reshuffle.integration.mjs --log-level=error && node node_modules/.cache/reshuffle.integration.mjs"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.1",

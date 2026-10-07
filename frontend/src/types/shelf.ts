@@ -45,6 +45,30 @@ export interface ShelfAssignResult {
   message: string
 }
 
+/** 整区换架单中的一条诉求：把批次挪到同温区目标窖位 */
+export interface ShelfReshuffleMove {
+  batchId: string
+  targetShelfId: string
+}
+
+/** 整区换架结果：成功时带回挪位统计，失败时带回拒绝原因 */
+export interface ShelfReshuffleResult {
+  ok: boolean
+  message: string
+  /** 实际挪动的批次数 */
+  moved?: number
+  /** 互换窖位的批次对数 */
+  swappedPairs?: number
+  /** 为腾位借过空位的窖位数 */
+  bufferShelves?: number
+  /** 占用数被纠正（原 occupied 与实际批次不一致）的窖位数 */
+  reconciled?: number
+  /** 跟随到新窖位的未执行转架作业条数 */
+  pendingTurningsUpdated?: number
+  /** 物理挪位步骤数（含借位缓冲步） */
+  steps?: number
+}
+
 /** 窖位页筛选条件：关键字 + 库房多选 + 温区多选 */
 export interface ShelfFilterState {
   keyword: string

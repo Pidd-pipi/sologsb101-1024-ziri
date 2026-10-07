@@ -340,6 +340,7 @@ export async function seedDatabase(): Promise<void> {
   const batchBId = 'batch_alp_02'
   const batchCId = 'batch_ewe_01'
   const batchDId = 'batch_buf_01'
+  const batchEId = 'batch_buf_02'
 
   const batches: Batch[] = [
     {
@@ -393,6 +394,19 @@ export async function seedDatabase(): Promise<void> {
       conclusion: '',
       createdAt: now,
       updatedAt: now
+    },
+    {
+      id: batchEId,
+      milkId: 'milk_buffalo',
+      curdedAt: '2025-03-09',
+      cheeseType: '洗皮',
+      targetDays: 45,
+      weightKg: 5.6,
+      state: '熟成中',
+      shelfId: 'shelf_b3',
+      conclusion: '',
+      createdAt: now,
+      updatedAt: now
     }
   ]
 
@@ -413,6 +427,17 @@ export async function seedDatabase(): Promise<void> {
       room: '一号熟成库',
       rackNo: 'B-02',
       layerNo: 2,
+      tempZone: '冷区',
+      capacity: 6,
+      occupied: 1,
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: 'shelf_b3',
+      room: '一号熟成库',
+      rackNo: 'B-03',
+      layerNo: 3,
       tempZone: '冷区',
       capacity: 6,
       occupied: 1,
@@ -466,6 +491,19 @@ export async function seedDatabase(): Promise<void> {
       doneAt: '2025-03-17',
       type: '转架',
       brinePct: 22,
+      operator: '周雨',
+      state: '待执行',
+      seq: 1,
+      createdAt: now,
+      updatedAt: now
+    },
+    {
+      id: 'turn_e1',
+      batchId: batchEId,
+      shelfId: 'shelf_b3',
+      doneAt: '2025-03-20',
+      type: '擦洗',
+      brinePct: 20,
       operator: '周雨',
       state: '待执行',
       seq: 1,

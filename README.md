@@ -96,7 +96,7 @@ sologsb101-1024/
 | 路由 | 页面 | 主要职责 | 消费模型 |
 | --- | --- | --- | --- |
 | `/milk` | 奶源与批次台账 | 新建奶源与批次，按乳种 / 批次状态筛选并同步 URL query；按目标熟成天数自动算最早可出库日期；状态流转「凝乳 → 熟成中 → 已出库 / 报废」；级联删除奶源与批次 | Milk、Batch |
-| `/shelves` | 熟成库货架与窖位 | 库房 / 货架号 / 层号 / 温区 / 可放块数维护，占用率卡片与进度条；上架时按余量硬校验并实时更新 `occupied`；下架释放余量 | Shelf、Batch |
+| `/shelves` | 熟成库货架与窖位 | 库房 / 货架号 / 层号 / 温区 / 可放块数维护，占用率卡片与进度条；上架时按余量硬校验并实时更新 `occupied`；下架释放余量；**整区换架**在同温区内一次性重排多个「熟成中」批次（含两个窖位对调，自动借空位腾挪），容量不够直接拒绝，事务失败整体回滚，未执行转架作业跟随新窖位 | Shelf、Batch、Turning |
 | `/turnings` | 转架 / 翻面 / 擦洗作业 | 按批次生成等间隔计划（起始日 + 间隔天数 × 次数）；逐条签署「待执行 → 已完成 / 已跳过」；HTML5 原生拖拽调整同批次内顺序并写回 `seq` | Turning、Batch、Shelf |
 | `/environment` | 温湿度记录与曲线 | 按温区阈值自动判定越界并标异常，提示开窗 / 加湿措施；手写 SVG 温湿度双曲线 + 越界点；一键重算异常标记 | Environment、Batch、Shelf |
 | `/tastings` | 出库品评与档案导出 | 外观 / 风味 / 质地三维打分，同批次均分回写批次结论；JSON 全量导出导入（覆盖 / 追加两种模式）、单批次档案导出、重置并重新播种 | Tasting 及全部模型 |
@@ -122,10 +122,21 @@ sologsb101-1024/
 | `environments` | Environment 环境记录 | `batchId` `recordedAt` `tempC` `humidityPct` `anomaly` `action` | id, batchId, recordedAt, anomaly |
 | `tastings` | Tasting 品评 | `batchId` `outAt` `appearance/flavor/texture` 描述 + 三维评分 `score` `conclusion` `taster` | id, batchId, outAt, score, conclusion |
 
-- **首屏自动播种**：`initDatabase()` 在 `db.open()` 后执行 `if ((await db.milks.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据（奶源 3 → 生产批次 4 → 转架 4 / 环境 4 / 品评 3），使用固定 id + `bulkPut`，**幂等**（重复调用不会产生重复记录）。
+- **首屏自动播种**：`initDatabase()` 在 `db.open()` 后执行 `if ((await db.milks.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据（奶源 3 → 生产批次 5 → 转架 5 / 环境 4 / 品评 3；冷区含两个窖位各放一个「熟成中」批次，可直接演示整区换架 / 对调），使用固定 id + `bulkPut`，**幂等**（重复调用不会产生重复记录）。
 - **localStorage**：仅存元数据 —— `gbcheeseage:db-version`（本地结构版本）、`gbcheeseage:last-backup-at`（最近一次导出时间）、`gbcheeseage:ui-prefs`（当前库房、作业排序方式、曲线指标）。
 - **导出 / 导入**：`frontend/src/utils/export.ts` 提供 `exportSnapshotJson()`（全量）、`exportBatchArchiveJson(batchId)`（单批次档案）与 `parseSnapshotJson()` 校验（校验 `app` 字段、各集合数组、父子引用完整性，失败抛出原因且不写入任何数据）；`/tastings` 页支持「覆盖导入」与「追加导入（重新分配 id）」。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
+
+### 整区换架规则（`utils/reshuffle.ts` + `shelfStore.reshuffleZone`）
+
+熟成库调整冷区窖位时，在 `/shelves` 页点「整区换架」，按温区一次性排好多个批次的新窖位：
+
+1. **只在同温区内挪**：一次换架单只处理同一温区（可跨库房）的「熟成中」在架批次；目标窖位跨温区、批次已出库 / 报废 / 未上架都会被拒绝。
+2. **中间也不能超载**：提交前 `planReshuffle()` 以实际挂接批次数（而非可能失真的 `occupied`）在内存中模拟物理挪位序列；两个窖位对调时若双方都满，会自动把占位批次先借位到同温区任意空位再归位（缓冲步同样受可放块数约束）。
+3. **整区凑不出位置即拒绝**：同一温区所有窖位全部放满时纯对调 / 循环对调无空位可借，直接以「容量不够」拒绝；换架后任一窖位块数超过可放块数同样拒绝。拒绝不写任何数据。
+4. **失败整体回滚**：规划通过后在单个 Dexie `rw` 事务内落库（批次 `shelfId` → 窖位 `occupied` 重算 → 转架作业跟位），写入中途异常由事务回滚，窖位与批次位置恢复原样。
+5. **转架作业跟位规则**：批次的「待执行」转架 / 翻面 / 擦洗作业 `shelfId` 跟随到新窖位；「已完成 / 已跳过」是历史签署记录，保留作业当时的窖位不动。
+6. **占用数对齐实际批次**：换架落库时全温区窖位 `occupied` 按实际挂接批次数重算（夹到 `[0, capacity]`），顺带纠正历史脏占用数。
 
 ---
 

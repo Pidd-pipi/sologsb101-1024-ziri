@@ -9,9 +9,12 @@ import {
   type ShelfAssignResult,
   type ShelfFilterState,
   type ShelfOccupancy,
+  type ShelfReshuffleMove,
+  type ShelfReshuffleResult,
   type TempZone
 } from '@/types/shelf'
 import type { Batch } from '@/types/batch'
+import { planReshuffle } from '@/utils/reshuffle'
 import { useMilkStore } from '@/stores/milkStore'
 
 export interface NewShelfInput {
@@ -257,6 +260,119 @@ export const useShelfStore = defineStore('shelf', () => {
     return { ok: true, message: `已下架，${shelfLabel(shelfId)} 释放 1 块余量` }
   }
 
+  /**
+   * 整区换架：把同一温区内的若干「熟成中」批次一次性挪到新窖位（含两个窖位互换）。
+   *
+   * - 只允许同温区内存放；先在内存中按「实际在架批次数」规划物理挪位序列，
+   *   任何中间步都会让窖位超出可放块数 / 整温区凑不出腾挪空位时直接拒绝，不写任何数据；
+   * - 规划通过后在单个 rw 事务内落库：批次 shelfId、窖位 occupied（按实际挂接批次重算，
+   *   顺带纠正脏占用数）、未执行（待执行）转架作业跟随到新窖位；
+   * - 已完成 / 已跳过的转架作业保留当时窖位不动；事务失败由 Dexie 整体回滚，窖位与批次恢复原样。
+   */
+  async function reshuffleZone(moves: ShelfReshuffleMove[]): Promise<ShelfReshuffleResult> {
+    if (moves.length === 0) {
+      return { ok: false, message: '请先为至少一个批次选择新窖位' }
+    }
+
+    // 以数据库最新数据做规划，避免 store 缓存滞后
+    const [liveBatches, liveShelves] = await Promise.all([
+      db.batches.toArray(),
+      db.shelves.toArray()
+    ])
+    const batchStates: Record<string, string> = {}
+    liveBatches.forEach((batch) => {
+      batchStates[batch.id] = batch.state
+    })
+
+    const plan = planReshuffle(moves, liveBatches, liveShelves, batchStates)
+    if (!plan.ok) {
+      return { ok: false, message: plan.message }
+    }
+
+    const movedBatchIds = plan.effectiveMoves.map((move) => move.batchId)
+    const zoneShelfIds = new Set(
+      liveShelves.filter((shelf) => shelf.tempZone === plan.zone).map((shelf) => shelf.id)
+    )
+    // 换架前各窖位实际在架批次数，用于识别需要纠正的脏占用数
+    const hostedBefore = new Map<string, number>()
+    zoneShelfIds.forEach((shelfId) => hostedBefore.set(shelfId, 0))
+    liveBatches.forEach((batch) => {
+      if (batch.shelfId && zoneShelfIds.has(batch.shelfId)) {
+        hostedBefore.set(batch.shelfId, (hostedBefore.get(batch.shelfId) ?? 0) + 1)
+      }
+    })
+    const reconciledShelfIds = new Set(
+      [...zoneShelfIds].filter((shelfId) => {
+        const shelf = liveShelves.find((item) => item.id === shelfId)
+        return !!shelf && shelf.occupied !== Math.max(0, Math.min(shelf.capacity, hostedBefore.get(shelfId) ?? 0))
+      })
+    )
+    const now = Date.now()
+
+    try {
+      let pendingTurningsUpdated = 0
+      await db.transaction('rw', [db.shelves, db.batches, db.turnings], async () => {
+        // 1. 批次落到新窖位（终态直接落，物理借位过程不落库——中间态由规划保证可行即可）
+        for (const move of plan.effectiveMoves) {
+          await db.batches.update(move.batchId, { shelfId: move.targetShelfId, updatedAt: now })
+        }
+
+        // 2. 未执行（待执行）转架作业跟随批次到新窖位；已完成 / 已跳过保留当时窖位
+        const pendingTurnings = await db.turnings
+          .where('batchId')
+          .anyOf(movedBatchIds)
+          .and((turning) => turning.state === '待执行')
+          .toArray()
+        const newShelfOf = new Map(plan.effectiveMoves.map((move) => [move.batchId, move.targetShelfId]))
+        for (const turning of pendingTurnings) {
+          const targetShelfId = newShelfOf.get(turning.batchId)
+          if (targetShelfId && turning.shelfId !== targetShelfId) {
+            await db.turnings.update(turning.id, { shelfId: targetShelfId, updatedAt: now })
+            pendingTurningsUpdated += 1
+          }
+        }
+
+        // 3. 全温区窖位占用数按「实际挂接批次数」重算，占用数与实际放着的批次严格对齐
+        for (const shelfId of zoneShelfIds) {
+          const shelf = await db.shelves.get(shelfId)
+          if (!shelf) continue
+          const hosted = await db.batches.where('shelfId').equals(shelfId).count()
+          const occupied = Math.max(0, Math.min(shelf.capacity, hosted))
+          if (shelf.occupied !== occupied) {
+            await db.shelves.update(shelfId, { occupied, updatedAt: now })
+          }
+        }
+      })
+
+      const reconciled = reconciledShelfIds.size
+      const swapText =
+        plan.swappedPairs.length > 0 ? `，其中 ${plan.swappedPairs.length} 对窖位互换` : ''
+      const bufferText =
+        plan.bufferShelfIds.length > 0 ? `，借 ${plan.bufferShelfIds.length} 个空位腾挪` : ''
+      const reconcileText = reconciled > 0 ? `；顺带纠正 ${reconciled} 个窖位的占用数` : ''
+      const turningText =
+        pendingTurningsUpdated > 0 ? `；${pendingTurningsUpdated} 条未执行转架作业已跟到新窖位` : ''
+      return {
+        ok: true,
+        message: `${plan.zone}换架完成：${movedBatchIds.length} 个批次已就位${swapText}${bufferText}${turningText}${reconcileText}`,
+        moved: movedBatchIds.length,
+        swappedPairs: plan.swappedPairs.length,
+        bufferShelves: plan.bufferShelfIds.length,
+        reconciled,
+        pendingTurningsUpdated,
+        steps: plan.steps.length
+      }
+    } catch (err) {
+      // 事务已整体回滚：批次 shelfId、窖位 occupied、转架作业均恢复原样
+      return {
+        ok: false,
+        message: `换架写入失败，窖位与批次位置已恢复原样：${
+          err instanceof Error ? err.message : '未知错误'
+        }`
+      }
+    }
+  }
+
   /** 按温区阈值给出窖位可用性说明，用于卡片提示 */
   function zoneOptions(): TempZone[] {
     return TEMP_ZONES
@@ -292,6 +408,7 @@ export const useShelfStore = defineStore('shelf', () => {
     removeShelf,
     assignBatch,
     releaseBatch,
+    reshuffleZone,
     zoneOptions
   }
 })

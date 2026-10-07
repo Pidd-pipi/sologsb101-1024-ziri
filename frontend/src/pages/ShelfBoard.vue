@@ -2,13 +2,14 @@
 import { computed, reactive, ref } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox, type FormInstance, type FormRules } from 'element-plus'
-import { Delete, Edit, Plus, Position } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Position, Switch } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, {
   type FilterModel,
   type FilterSelectConfig
 } from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
+import ReshuffleDialog from '@/components/shelf/ReshuffleDialog.vue'
 import { useMilkStore } from '@/stores/milkStore'
 import { useShelfStore } from '@/stores/shelfStore'
 import { TEMP_ZONES, createEmptyShelfFilter, type Shelf, type TempZone } from '@/types/shelf'
@@ -37,6 +38,7 @@ const shelfFormRef = ref<FormInstance>()
 const assignFormRef = ref<FormInstance>()
 const shelfDialogVisible = ref(false)
 const assignDialogVisible = ref(false)
+const reshuffleDialogVisible = ref(false)
 const editingShelfId = ref<string | null>(null)
 
 const shelfForm = reactive({
@@ -252,6 +254,7 @@ function batchOptionLabel(batchId: string): string {
       </div>
       <div>
         <el-button type="primary" :icon="Plus" @click="openShelfDialog()">新建窖位</el-button>
+        <el-button :icon="Switch" @click="reshuffleDialogVisible = true">整区换架</el-button>
         <el-button :icon="Position" :disabled="unassignedBatches.length === 0" @click="openAssignDialog()">
           上架分配
         </el-button>
@@ -509,6 +512,8 @@ function batchOptionLabel(batchId: string): string {
         <el-button type="primary" @click="submitAssign">确认上架</el-button>
       </template>
     </el-dialog>
+
+    <ReshuffleDialog v-model="reshuffleDialogVisible" />
   </section>
 </template>
 
